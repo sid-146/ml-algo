@@ -1,0 +1,251 @@
+version: "3.9"
+
+# Universal data-engineering stack
+# Use profiles to start only what you need.
+# Examples:
+#   docker compose --profile core up -d
+#   docker compose --profile core --profile streaming up -d
+#   docker compose --profile core --profile batch --profile orchestration up -d
+
+networks:
+  data-net:
+
+volumes:
+  postgres_data:
+  minio_data:
+  kafka_data:
+  spark_data:
+  airflow_logs:
+  airflow_dags:
+  airflow_plugins:
+  grafana_data:
+  redis_data:
+
+services:
+  # =========================
+  # CORE SERVICES
+  # =========================
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    profiles: ["core", "batch", "analytics", "ml", "orchestration"]
+    environment:
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: devpass
+      POSTGRES_DB: devdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - data-net
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    profiles: ["core", "batch", "analytics", "ml"]
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # Web console
+    volumes:
+      - minio_data:/data
+    networks:
+      - data-net
+
+  jupyter:
+    image: jupyter/pyspark-notebook:latest
+    container_name: jupyter
+    profiles: ["core", "batch", "streaming", "ml"]
+    environment:
+      JUPYTER_TOKEN: dev
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./data:/data
+    networks:
+      - data-net
+    depends_on:
+      - postgres
+      - minio
+
+  redis:
+    image: redis:7
+    container_name: redis
+    profiles: ["core", "ml", "streaming"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - data-net
+
+  # =========================
+  # STREAMING STACK
+  # =========================
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: zookeeper
+    profiles: ["streaming"]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - data-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    profiles: ["streaming"]
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    ports:
+      - "9092:9092"   # inside Docker network
+      - "19092:19092" # from host
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - data-net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    profiles: ["streaming", "tools"]
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8081:8080"
+    networks:
+      - data-net
+
+  # =========================
+  # BATCH / BIG DATA (SPARK)
+  # =========================
+
+  spark-master:
+    image: bitnami/spark:3.5
+    container_name: spark-master
+    profiles: ["batch"]
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
+      SPARK_SSL_ENABLED: "no"
+    ports:
+      - "7077:7077" # Spark cluster
+      - "8080:8080" # Spark master UI
+    volumes:
+      - ./data:/data
+      - spark_data:/opt/spark
+    networks:
+      - data-net
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    container_name: spark-worker
+    profiles: ["batch"]
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
+      SPARK_SSL_ENABLED: "no"
+    ports:
+      - "8082:8081" # Spark worker UI
+    volumes:
+      - ./data:/data
+      - spark_data:/opt/spark
+    networks:
+      - data-net
+
+  # =========================
+  # ORCHESTRATION (AIRFLOW)
+  # =========================
+
+  airflow:
+    image: apache/airflow:2.9.2
+    container_name: airflow
+    profiles: ["orchestration", "batch"]
+    # Airflow standalone uses SQLite & starts scheduler + webserver
+    command: ["airflow", "standalone"]
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__EXECUTOR: "LocalExecutor"
+      # Timezone etc can be adjusted
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "False"
+    ports:
+      - "8080:8080"  # Airflow Web UI
+    volumes:
+      - airflow_dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+      - airflow_plugins:/opt/airflow/plugins
+      - ./data:/data
+    networks:
+      - data-net
+
+  # =========================
+  # ANALYTICS / MONITORING
+  # =========================
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana
+    profiles: ["analytics", "monitoring"]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - data-net
+
+  # You can later add Prometheus, Trino, Superset, MLflow, etc.
+  # Example skeletons (commented so stack is still ready-to-run):
+  #
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   container_name: prometheus
+  #   profiles: ["monitoring"]
+  #   volumes:
+  #     - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml
+  #   ports:
+  #     - "9090:9090"
+  #   networks:
+  #     - data-net
+  #
+  # trino:
+  #   image: trinodb/trino:latest
+  #   container_name: trino
+  #   profiles: ["batch", "analytics"]
+  #   ports:
+  #     - "8082:8080"
+  #   volumes:
+  #     - ./configs/trino/catalog:/etc/trino/catalog
+  #   networks:
+  #     - data-net
